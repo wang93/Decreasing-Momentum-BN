@@ -1,5 +1,4 @@
 import torch.nn as nn
-from SampleRateLearning.grad_scaling import Grad_Scaling
 
 cfg = {
     'GAP': [],

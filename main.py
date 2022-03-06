@@ -11,7 +11,6 @@ from importlib import import_module
 import random
 from utils.standard_actions import prepare_running
 from utils.summary_writers import SummaryWriters
-from SampleRateLearning import global_variables
 from copy import deepcopy
 from utils.lr_strategy_generator import MileStoneLR_WarmUp
 
@@ -38,18 +37,9 @@ def main():
     parser.add_argument('--arc', default='lenet', type=str, help='architecture name')
     parser.add_argument('--dtype', default='float', type=str, help='dtype of parameters and buffers')
     parser.add_argument('--seed', default=0, type=int, help='rand seed')
-    parser.add_argument("--srl_in_train", action="store_true", help="srl by training but not val samples")
-    parser.add_argument('--srl_lr', default=0.001, type=float, help='learning rate of srl')
-    parser.add_argument('--srl_optim', default='adamw', type=str, help='the optimizer for srl')
-    parser.add_argument('--srl_start', default=9999, type=int, help='start srl after which epoch')
-    parser.add_argument('--sample_rates', default=None, type=str, help='sample rates in srl')
-    parser.add_argument('--val_ratio', default=0., type=float, help='ratio of validation set in the training set')
-    parser.add_argument('--valBatchSize', '-vb', default=32, type=int, help='validation batch size')
     parser.add_argument('--special_bn', default=-1, type=int, help='version of stable bn')
     parser.add_argument('--warmup_till', '-wt', default=1, type=int, help='version of stable bn')
-    parser.add_argument('--warmup_mode', '-wm', default='const', type=str, help='version of stable bn')
-    parser.add_argument("--weight_center", '-wc', action="store_true", help="centralize all the weights")
-    parser.add_argument("--final_zero", action="store_true", help="set params in the final layer to zero")
+    parser.add_argument('--warmup_mode', '-wm', default='const', type=str, help='version of warmup')
     args = parser.parse_args()
 
     if args.classes is None:
@@ -80,19 +70,6 @@ def main():
             sub_sample.append(r ** i)
         args.sub_sample = sub_sample
 
-    if args.srl_start < args.epoch and args.val_ratio <= 0.:
-        args.srl_in_train = True
-
-    # if args.srl and args.val_ratio <= 0.:
-    #     args.srl_in_train = True
-    #
-    # if not args.srl:
-    #     args.srl_alternate = False
-    #     args.srl_in_train = False
-
-    if args.sample_rates is not None:
-        args.sample_rates = eval(args.sample_rates)
-
     args.milestones = eval(args.milestones)
 
     prepare_running(args)
@@ -108,11 +85,8 @@ class Solver(object):
         self.optimizer = None
         self.scheduler = None
         self.train_loader = None
-        self.val_loader = None
         self.test_loader = None
         self.recorder = SummaryWriters(self.config, len(self.config.classes))
-        global_variables.classes_num = len(self.config.classes)
-        global_variables.train_batch_size = self.config.trainBatchSize
 
     @staticmethod
     def _sub_data(dataset, classes, ratios=None):
@@ -182,28 +156,7 @@ class Solver(object):
         else:
             raise NotImplementedError
         train_set = self._sub_data(train_set, self.config.classes, self.config.sub_sample)
-        train_set, val_set = self._split_data(train_set, test_transform, self.config.val_ratio)
 
-        if val_set is not None:
-            from SampleRateLearning.sampler import ValidationBatchSampler
-            batch_sampler = ValidationBatchSampler(data_source=val_set, batch_size=self.config.valBatchSize)
-            self.val_loader = iter(torch.utils.data.DataLoader(dataset=val_set, batch_sampler=batch_sampler))
-
-        # if self.config.srl:
-        #     from SampleRateLearning.sampler import SampleRateBatchSampler
-        #     from SampleRateLearning.loss import SRL_CELoss as SRL_LOSS
-        #
-        #     batch_sampler = SampleRateBatchSampler(data_source=train_set, batch_size=self.config.trainBatchSize)
-        #     self.train_loader = torch.utils.data.DataLoader(dataset=train_set, batch_sampler=batch_sampler)
-        #
-        #     self.criterion = SRL_LOSS(sampler=batch_sampler,
-        #                               optim=self.config.srl_optim,
-        #                               lr=max(self.config.srl_lr, 0),
-        #                               sample_rates=self.config.sample_rates,
-        #                               precision_super=self.config.srl_precision,
-        #                               ).cuda()
-        #
-        # else:
         self.train_loader = torch.utils.data.DataLoader(dataset=train_set, batch_size=self.config.trainBatchSize,
                                                         shuffle=True)
         self.criterion = nn.CrossEntropyLoss().cuda()
@@ -218,19 +171,6 @@ class Solver(object):
         self._sub_data(test_set, self.config.classes)
         self.test_loader = torch.utils.data.DataLoader(dataset=test_set, batch_size=self.config.testBatchSize,
                                                        shuffle=False)
-
-    def load_data_srl(self):
-        from SampleRateLearning.sampler import SampleRateBatchSampler
-        from SampleRateLearning.loss import SRL_CELoss as SRL_LOSS
-        train_set = self.train_loader.dataset
-        batch_sampler = SampleRateBatchSampler(data_source=train_set, batch_size=self.config.trainBatchSize)
-        self.train_loader = torch.utils.data.DataLoader(dataset=train_set, batch_sampler=batch_sampler)
-        self.criterion = SRL_LOSS(sampler=batch_sampler,
-                                  optim=self.config.srl_optim,
-                                  lr=max(self.config.srl_lr, 0),
-                                  sample_rates=self.config.sample_rates,
-                                  in_train=self.config.srl_in_train,
-                                  ).cuda()
 
     def load_model(self):
         targets = self.train_loader.dataset.targets
@@ -271,16 +211,6 @@ class Solver(object):
 
         self.model = nn.DataParallel(model).cuda()
 
-        if self.config.weight_center:
-            from WeightModification.recentralize import recentralize
-            recentralize(self.model)
-
-        if self.config.final_zero:
-            final_fc = self.model.module.final_fc
-            final_fc.weight.data = torch.zeros_like(final_fc.weight.data)
-            if final_fc.bias is not None:
-                final_fc.bias.data = torch.zeros_like(final_fc.bias.data)
-
         if self.config.optim == 'adam':
             self.optimizer = optim.Adam(self.model.parameters(), lr=self.config.lr)
         elif self.config.optim == 'sgd':
@@ -311,51 +241,16 @@ class Solver(object):
         iter_num_per_epoch = len(self.train_loader)
         global_step = (epoch - 1) * iter_num_per_epoch
 
-        # if self.config.srl_start + 1 == epoch:
-        #     for param in self.model.parameters():
-        #         param.requires_grad = False
-        #     for param in self.model.module.final_fc.parameters():
-        #         param.requires_grad = True
-        #     for pg in self.optimizer.param_groups:
-        #         pg['params'] = list(filter(lambda p: p.requires_grad, pg['params']))
-
         for batch_num, (data, target) in enumerate(self.train_loader):
             data, target = data.cuda(), target.cuda()
-            global_variables.parse_target(target)
 
-            # optimize model params
-            # if self.config.srl_start + 1 <= epoch and (self.config.sample_rates is not None):
-            #     self.model.eval()
-            #     # self.model.module.final_fc.train()
-            # else:
-            #     self.model.train()
-            if self.config.srl_start + 1 <= epoch:
-                self.model.eval()
-                # self.model.module.final_fc.train()
-            else:
-                self.model.train()
-
-            self.criterion.eval()
-            # if self.config.srl_start + 1 <= epoch and self.config.srl_in_train:
-            #     self.criterion.train()
-            # else:
-            #     self.criterion.eval()
+            self.model.train()
 
             self.optimizer.zero_grad()
             output = self.model(data)
             loss = self.criterion(output, target)
             loss.backward()
             self.optimizer.step()
-
-            # srl
-            # if self.config.srl_start < epoch and (not self.config.srl_in_train):
-            #     self.model.eval()
-            #     self.criterion.train()
-            #     val_data, val_target = self.val_loader.next()
-            #     val_data, val_target = val_data.cuda(), val_target.cuda()
-            #     with torch.no_grad():
-            #         val_output = self.model(val_data)
-            #     self.criterion(val_output, val_target)
 
             train_loss += loss.item()
             prediction = torch.max(output, 1)  # second param "1" represents the dimension to be reduced
@@ -371,9 +266,6 @@ class Solver(object):
                                       criterion=self.criterion)
 
         print('training loss:'.ljust(19) + '{:.5f}'.format(train_loss / (batch_num + 1)))
-        # if self.config.srl_start < epoch:
-        #     m = lambda x: '{:.3f}'.format(x)
-        #     print('sample rates:'.ljust(19) + ', '.join(map(m, self.criterion.sampler.sample_rates)))
 
         return train_loss, train_correct / total
 
@@ -423,31 +315,12 @@ class Solver(object):
 
         print('worst precision:'.ljust(19) + '{:.1f}%'.format(worst_precision * 100))
 
-        # sample_nums = cm.sum(axis=1)  # for recall
-        #
-        # hitted_nums = cm.diagonal()
-        # recalls = hitted_nums.astype(float) / sample_nums.astype(float)
-        #
-        # s = 'recalls:'.ljust(19)
-        # for p in recalls:
-        #     s += '{:.1f}%, '.format(p * 100)
-        # print(s)
-        #
-        # average_recall = sum(recalls) / len(recalls)
-        # print('average recall:'.ljust(19) + '{:.2f}%'.format(average_recall * 100))
-        #
-        # worst_recall = min(recalls)
-        #
-        # print('worst recall:'.ljust(19) + '{:.1f}%'.format(worst_recall * 100))
-
         iter_num_per_epoch = len(self.train_loader)
         global_step = epoch * iter_num_per_epoch
 
         self.recorder.record_epoch(accuracy, precisions, global_step)
-        # self.recorder.record_epoch(accuracy, recalls, global_step)
 
         return test_loss, test_correct / total, worst_precision
-        # return test_loss, test_correct / total, worst_recall
 
     def save(self):
         model_out_path = join('./exps', self.config.exp, "model.pth")
@@ -462,15 +335,6 @@ class Solver(object):
         worst_precision = 0
         for epoch in range(1, self.config.epoch + 1):
             self.scheduler.step(epoch)
-
-            # if self.config.srl_start + 1 == epoch:
-            #     self.load_data_srl()
-
-            if self.config.srl_start < epoch and self.config.srl_lr < 0:
-                cur_lr = self.optimizer.param_groups[0]['lr']
-                # cur_momentum = self.optimizer.param_groups[0]['momentum']
-                self.criterion.optimizer.param_groups[0]['lr'] = cur_lr * 10.  # / (1. - cur_momentum)
-
             print("\n===> epoch: {0}/{1}".format(epoch, self.config.epoch))
             self.train(epoch)
             test_result = self.test(epoch)
