@@ -1,0 +1,8 @@
+*.idea/
+.pyc
+*tasks*
+*.pyc
+*data/
+*exps/
+*__pycache__/
+temp.py
